@@ -70,6 +70,8 @@ private:
     void onLayerItemChanged(QTreeWidgetItem* item, int column);
     void onLayerItemDoubleClicked(QTreeWidgetItem* item, int column);
 
+    void clearSelection();
+
     QIcon colorIcon(const QColor& c) const;
 
     QGraphicsView* view_ = nullptr;

@@ -9,9 +9,11 @@
 #include <QGraphicsPixmapItem>
 #include <QGraphicsSimpleTextItem>
 #include <QGraphicsEllipseItem>
+#include <QGraphicsDropShadowEffect>
 #include <QGraphicsLineItem>
 #include <QPen>
 #include <QFont>
+#include <QString>
 #include <cmath>
 
 GridScene::GridScene(QObject* parent)
@@ -50,8 +52,30 @@ void GridScene::setParameterSet(ParameterSet* params)
 
 void GridScene::rebuildRaster()
 {
+    QRectF savedSelectionRect;
+    if (selectionRectItem_) {
+        savedSelectionRect = selectionRectItem_->rect();
+    }
+
+    for (auto* item : coastlineCells_) {
+        removeItem(item);
+    }
+
+    for (auto* item : coastlineLabelItems_) {
+        removeItem(item);
+    }
+
     clear();
     mapTileItems_.clear();
+    selectionRectItem_ = nullptr;
+
+    for (auto* item : coastlineCells_) {
+        addItem(item);
+    }
+
+    for (auto* item : coastlineLabelItems_) {
+        addItem(item);
+    }
 
     if (!gradient_) return;
 
@@ -97,6 +121,13 @@ void GridScene::rebuildRaster()
     // Layer 30: Source ellipses
     if (showSources_ && params_)
         renderSourceEllipses();
+
+    if (!savedSelectionRect.isNull() &&
+        savedSelectionRect.width() > 0 &&
+        savedSelectionRect.height() > 0)
+    {
+        setSelectedRegion(savedSelectionRect);
+    }
 }
 
 void GridScene::renderBathymetryTiles()
@@ -500,3 +531,119 @@ void GridScene::setShowSubgridLines(bool show) { showSubgrids_ = show; rebuildRa
 void GridScene::setShowSources(bool show) { showSources_ = show; rebuildRaster(); }
 void GridScene::setShowBathIsolines(bool show) { showBathIso_ = show; rebuildRaster(); }
 void GridScene::setShowOverlayIsolines(bool show) { showOverlayIso_ = show; rebuildRaster(); }
+
+void GridScene::setSelectedRegion(const QRectF &rect) {
+    if (selectionRectItem_) {
+        removeItem(selectionRectItem_);
+        delete selectionRectItem_;
+        selectionRectItem_ = nullptr;
+    }
+
+    QPen pen(Qt::red, 2, Qt::SolidLine);
+    selectionRectItem_ = addRect(rect, pen);
+
+    const int Z_VALUE_FOR_SELECTION = 100;
+    selectionRectItem_->setZValue(Z_VALUE_FOR_SELECTION);
+
+    update();
+}
+
+void GridScene::clearSelectionRegion() {
+    if (selectionRectItem_) {
+        removeItem(selectionRectItem_);
+    }
+    delete selectionRectItem_;
+    selectionRectItem_ = nullptr;
+    update();
+}
+
+bool GridScene::hasSelectedRegion() const { return selectionRectItem_ != nullptr; }
+
+QRectF GridScene::selectionRegion() const {
+    if (selectionRectItem_) {
+        return selectionRectItem_->rect();
+    }
+    return QRectF();
+}
+
+void GridScene::setCoastlineCells(const QVector<QPointF> &cells) {
+    for (auto* item : coastlineCells_) {
+        removeItem(item);
+        delete item;
+    }
+    coastlineCells_.clear();
+
+    if (cells.isEmpty()) {
+        return;
+    }
+
+    QBrush brush(Qt::red);
+    QPen pen(Qt::red, 1, Qt::SolidLine);
+    pen.setCosmetic(true);
+
+    for (const QPointF& cell : cells) {
+        const qreal CELL_SIDE_SIZE = 1.0;
+        QGraphicsRectItem* rect = addRect(cell.x(), cell.y(), CELL_SIDE_SIZE, CELL_SIDE_SIZE, pen, brush);
+
+        const int Z_VALUE_FOR_COASTLINE = 99;
+        rect->setZValue(Z_VALUE_FOR_COASTLINE);
+
+        rect->setVisible(coastlineVisible_);
+
+        coastlineCells_.append(rect);
+    }
+
+    update();
+}
+
+void GridScene::setCoastlineVisible(bool visible) {
+    if (visible == coastlineVisible_) {
+        return;
+    }
+
+    coastlineVisible_ = visible;
+
+    for (auto* item : coastlineCells_) {
+        item->setVisible(coastlineVisible_);
+    }
+
+    for (auto* item : coastlineLabelItems_) {
+        item->setVisible(coastlineVisible_);
+    }
+}
+
+void GridScene::setCoastlineLabels(const QMap<int, QPointF>& labels)
+{
+    for (auto* item : coastlineLabelItems_) {
+        removeItem(item);
+        delete item;
+    }
+    coastlineLabelItems_.clear();
+    coastlineLabels_ = labels;
+
+    for (auto it = labels.begin(); it != labels.end(); ++it) {
+        int id = it.key();
+        QPointF pos = it.value();
+
+        QGraphicsSimpleTextItem* textItem = new QGraphicsSimpleTextItem(QString::number(id));
+
+        textItem->setFlag(QGraphicsItem::ItemIgnoresTransformations, true);
+        textItem->setPos(pos.x(), pos.y());
+        textItem->setBrush(Qt::white);
+        textItem->setFont(QFont("Arial", 10, QFont::Bold));
+
+        QGraphicsDropShadowEffect* shadow = new QGraphicsDropShadowEffect;
+        shadow->setBlurRadius(3);
+        shadow->setColor(Qt::black);
+        shadow->setOffset(1, 1);
+
+        textItem->setGraphicsEffect(shadow);
+        textItem->setVisible(coastlineVisible_);
+
+        const int Z_VALUE_FOR_COASTLINE_LABELS = 101;
+        textItem->setZValue(Z_VALUE_FOR_COASTLINE_LABELS);
+
+        addItem(textItem);
+        coastlineLabelItems_.append(textItem);
+    }
+}

@@ -25,6 +25,15 @@ public:
     void setTileProvider(TileProvider* provider);
     void setParameterSet(ParameterSet* params);
 
+    // Selection region
+    void setSelectedRegion(const QRectF &rect);
+    void clearSelectionRegion();
+    bool hasSelectedRegion() const;
+    QRectF selectionRegion() const;
+    void setCoastlineCells(const QVector<QPointF>& cells);
+    void setCoastlineVisible(bool visible);
+    void setCoastlineLabels(const QMap<int, QPointF>& labels);
+
     // Rebuild the raster image from grid data + gradient
     void rebuildRaster();
 
@@ -87,6 +96,12 @@ private:
     GradientEditor* gradient_ = nullptr;
     TileProvider* tileProvider_ = nullptr;
     ParameterSet* params_ = nullptr;
+    QGraphicsRectItem* selectionRectItem_ = nullptr;
+
+    QVector<QGraphicsRectItem*> coastlineCells_;
+    bool coastlineVisible_ = true;
+    QMap<int, QPointF> coastlineLabels_;
+    QVector<QGraphicsSimpleTextItem*> coastlineLabelItems_;
 
     QImage overlayImage_;
     bool hasOverlay_ = false;
