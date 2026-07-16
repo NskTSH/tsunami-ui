@@ -47,10 +47,30 @@ Paths resolve from `NSKTSH_DATA` / `NSKTSH_RESULTS` (default `../Data`, `../Resu
 
 ## Complex cases
 ### CoastHistogramTool
-The coastline ordering algorithm handles complex cases as follows:
-- **Islands / closed loops**: Full perimeter traversal via traverseComponent().
-- **Breaks (multiple components)**: The algorithm orders all found components separately. This allows for outputting data for all found components, adding separators.
-- **Coves**: Traversal from the farthest endpoint via greedy walk with backtracking.
+Coastal cells are linked into an 8-connected graph, split into connected
+components, and each component large enough to keep is walked to give the
+histogram its order. The walk always steps onto the most constrained unvisited
+neighbour (fewest unvisited neighbours of its own, orthogonal before diagonal).
+That is a greedy heuristic, not a guarantee: it keeps the walk from cutting the
+diagonal corners an 8-connected contour carries, but it can still box itself in.
+- **Islands / closed loops**: a smooth perimeter is emitted once, one bar per
+  cell. A ragged perimeter can still dead-end and retrace, so bars may exceed
+  cells there too.
+- **Breaks (multiple components)**: each plotted component is ordered
+  separately, and they are joined by separators so that all of them appear.
+- **Coves / dead ends**: the walk retraces out of a dead end, re-emitting those
+  cells, so the series stays spatially continuous. A cove is therefore walked
+  twice, in and back out, as a survey along the shore would be.
+- **Tiny components**: components below 5 cells are treated as coastal noise and
+  are not plotted; the number dropped is reported in the tool.
+
+Within a plotted component every cell is emitted at least once and consecutive
+bars are always neighbouring cells; only the amount of retrace varies with the
+shape. Components themselves are separated by an explicit separator, and cells
+with no wave-height sample, or in a component below the size filter, are not
+plotted at all. Because of the retrace the number of bars can exceed the number
+of coastal cells. The map overlay and the reported "Coast nodes" count take each
+cell once.
 
 ## License
 Apache-2.0 © NskTSH — see [`LICENSE`](LICENSE) and `NOTICE`.

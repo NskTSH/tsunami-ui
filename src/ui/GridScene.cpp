@@ -619,7 +619,6 @@ void GridScene::setCoastlineLabels(const QMap<int, QPointF>& labels)
         delete item;
     }
     coastlineLabelItems_.clear();
-    coastlineLabels_ = labels;
 
     for (auto it = labels.begin(); it != labels.end(); ++it) {
         int id = it.key();

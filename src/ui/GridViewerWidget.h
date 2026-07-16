@@ -1,7 +1,12 @@
 #pragma once
 
 #include <QWidget>
+#include <QFuture>
+#include <atomic>
+#include <memory>
 #include <vector>
+
+#include "model/ResultDataset.h"
 
 class QGraphicsView;
 class QToolBar;
@@ -14,7 +19,6 @@ class QTreeWidgetItem;
 class GridScene;
 class GradientEditor;
 class GridDataset;
-class ResultDataset;
 class ParameterSet;
 class TileProvider;
 class AnimationPlayer;
@@ -27,6 +31,22 @@ class GridViewerWidget : public QWidget
 
 public:
     explicit GridViewerWidget(QWidget* parent = nullptr);
+    ~GridViewerWidget() override;
+
+    // Stops every background task that reads the ResultDataset and waits for
+    // them to unwind. Must be called before whatever owns that dataset goes
+    // away, otherwise a worker keeps reading a destroyed object.
+    void cancelBackgroundWork();
+
+    // Drops the histogram's scale authority and re-arms the scan against the
+    // result set now loaded. Call after replacing what results_ points at, or
+    // after loading new frames into it.
+    void onResultSourceChanged();
+
+    // Pushes the first indexed frame into the overlay and the analysis tools, so
+    // they show the result set that is actually loaded rather than the previous
+    // one. Returns false when nothing is indexed.
+    bool showFirstResultFrame();
 
     void setGridDataset(GridDataset* grid, const QString& filename = {});
     void setResultDataset(ResultDataset* results);
@@ -71,6 +91,8 @@ private:
     void onLayerItemDoubleClicked(QTreeWidgetItem* item, int column);
 
     void clearSelection();
+    void startRegionScan(int rowMin, int rowMax, int colMin, int colMax);
+    void invalidateResultEpoch();
 
     QIcon colorIcon(const QColor& c) const;
 
@@ -107,6 +129,30 @@ private:
     CoastHistogramTool* coastTool_ = nullptr;
     ResultDataset* results_ = nullptr;
     GridDataset* grid_ = nullptr;
+
+    // Rubber-band endpoints in scene coordinates. The flag is the only valid
+    // "unset" marker: (0,0) is the grid origin, a perfectly legal endpoint.
+    bool hasRubberBand_ = false;
     QPointF lastRubberFrom_;
     QPointF lastRubberTo_;
+
+    // Last selected region, kept so the scan can be re-armed when the result
+    // set underneath it is replaced.
+    bool hasSelection_ = false;
+    int selRowMin_ = 0, selRowMax_ = 0, selColMin_ = 0, selColMax_ = 0;
+
+    // Background scan of every frame over the selected region. The flag is
+    // polled by the worker so a cancel does not have to wait out the whole scan.
+    QFuture<double> regionScan_;
+    std::shared_ptr<std::atomic_bool> regionScanCancelled_;
+
+    // The single-file load also reads the dataset off the GUI thread, so it is
+    // tracked here too; nothing else keeps that dataset alive for it.
+    QFuture<std::shared_ptr<FrameData>> frameLoad_;
+
+    // Joining frameLoad_ waits for the parse but cannot un-queue the GUI
+    // continuation Qt has already scheduled. The continuation compares this
+    // epoch instead, so a frame from a result set we have since moved off is
+    // dropped rather than painted over the current one.
+    quint64 resultEpoch_ = 0;
 };

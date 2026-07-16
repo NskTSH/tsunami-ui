@@ -23,6 +23,7 @@ bool ResultDataset::scanDirectory(const QString& dirPath)
     frameIndex_.clear();
     cache_.clear();
     cacheOrder_.clear();
+    ++generation_;
     dirPath_ = dirPath;
 
     // Strategy 1: look for eta_timestep_N.txt
@@ -59,6 +60,7 @@ bool ResultDataset::loadSingleFile(const QString& filePath)
     frameIndex_.clear();
     cache_.clear();
     cacheOrder_.clear();
+    ++generation_;
     dirPath_ = QFileInfo(filePath).absolutePath();
 
     frameIndex_[0] = filePath;
@@ -86,14 +88,30 @@ std::shared_ptr<FrameData> ResultDataset::frame(int timestep)
 
     QString path = frameIndex_[timestep];
 
+    // Snapshot the transpose dimensions here: loadFrame runs with the lock
+    // released, and setExpectedGridDims can rewrite them from the GUI thread
+    // while a worker is mid-read.
+    const int expectedRows = expectedGridRows_;
+    const int expectedCols = expectedGridCols_;
+    const quint64 generation = generation_;
+
     // Release lock during disk I/O (loadFrame is pure)
     lock.unlock();
-    auto f = loadFrame(path, timestep);
+    auto f = loadFrame(path, timestep, expectedRows, expectedCols);
     if (!f)
         return nullptr;
 
     // Re-acquire to update cache
     lock.relock();
+
+    // The interpretation may have changed while the lock was released. Caching
+    // now would publish a frame decoded under the old dimensions or from a path
+    // that is no longer indexed, and an invalidated cache makes that insertion
+    // look valid. Hand the frame back to this caller but do not keep it.
+    if (generation != generation_) {
+        return f;
+    }
+
     // Another thread may have loaded this frame while we were reading
     if (cache_.contains(timestep))
         return cache_[timestep];
@@ -109,14 +127,21 @@ std::shared_ptr<FrameData> ResultDataset::frame(int timestep)
 
 void ResultDataset::setExpectedGridDims(int gridRows, int gridCols)
 {
-    if (expectedGridRows_ != gridRows || expectedGridCols_ != gridCols) {
-        expectedGridRows_ = gridRows;
-        expectedGridCols_ = gridCols;
-        // Invalidate cache — frames need re-reading with new transpose logic
-        QMutexLocker lock(&mutex_);
-        cache_.clear();
-        cacheOrder_.clear();
+    // Held across the whole update: the dimensions and the cache they govern
+    // have to change together, or a frame read under the old dimensions can land
+    // in the cache after it was invalidated.
+    QMutexLocker lock(&mutex_);
+
+    if (expectedGridRows_ == gridRows && expectedGridCols_ == gridCols) {
+        return;
     }
+
+    expectedGridRows_ = gridRows;
+    expectedGridCols_ = gridCols;
+    // Invalidate cache — frames need re-reading with new transpose logic
+    cache_.clear();
+    cacheOrder_.clear();
+    ++generation_;
 }
 
 void ResultDataset::clear()
@@ -125,12 +150,14 @@ void ResultDataset::clear()
     frameIndex_.clear();
     cache_.clear();
     cacheOrder_.clear();
+    ++generation_;
     dirPath_.clear();
     expectedGridRows_ = 0;
     expectedGridCols_ = 0;
 }
 
-std::shared_ptr<FrameData> ResultDataset::loadFrame(const QString& path, int timestep)
+std::shared_ptr<FrameData> ResultDataset::loadFrame(const QString& path, int timestep,
+                                                    int expectedRows, int expectedCols)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly | QIODevice::Text))
@@ -161,11 +188,11 @@ std::shared_ptr<FrameData> ResultDataset::loadFrame(const QString& path, int tim
     // Simulator writes eta(i,j) where i=nx(=ASC cols), j=ny(=ASC rows)
     // So file has nx rows × ny cols, but grid expects nrows × ncols
     bool doTranspose = false;
-    if (expectedGridRows_ > 0 && expectedGridCols_ > 0) {
-        bool matchesDirect = (fileRows == expectedGridRows_) &&
-                             (fileCols == expectedGridCols_ || fileCols == expectedGridCols_ + 1);
-        bool matchesTransposed = (fileRows == expectedGridCols_ || fileRows == expectedGridCols_ + 1) &&
-                                 (fileCols == expectedGridRows_ || fileCols == expectedGridRows_ + 1);
+    if (expectedRows > 0 && expectedCols > 0) {
+        bool matchesDirect = (fileRows == expectedRows) &&
+                             (fileCols == expectedCols || fileCols == expectedCols + 1);
+        bool matchesTransposed = (fileRows == expectedCols || fileRows == expectedCols + 1) &&
+                                 (fileCols == expectedRows || fileCols == expectedRows + 1);
         if (!matchesDirect && matchesTransposed)
             doTranspose = true;
     }

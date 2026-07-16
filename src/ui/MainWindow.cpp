@@ -50,12 +50,24 @@ MainWindow::MainWindow(QWidget* parent)
     statusBar()->showMessage(tr("Ready"));
 }
 
+MainWindow::~MainWindow()
+{
+    // project_ is constructed before the map widget, so QObject tears it down
+    // first -- taking the ResultDataset with it while a region scan may still be
+    // reading frames. This body runs before any child is destroyed.
+    if (gridViewer_) {
+        gridViewer_->cancelBackgroundWork();
+    }
+}
+
 void MainWindow::setupMenuBar()
 {
     auto* fileMenu = menuBar()->addMenu(tr("&File"));
 
     auto* newProjectAction = fileMenu->addAction(tr("&New Project"));
     connect(newProjectAction, &QAction::triggered, this, [this]() {
+        // The project owns the ResultDataset a region scan may still be reading.
+        gridViewer_->cancelBackgroundWork();
         project_->deleteLater();
         project_ = new Project(this);
         connectModules();
@@ -68,17 +80,26 @@ void MainWindow::setupMenuBar()
             this, tr("Open Project"), QString(),
             tr("Tsunami Project (*.tsunamiproj);;All Files (*)"));
         if (!path.isEmpty()) {
-            project_->deleteLater();
-            project_ = new Project(this);
-            if (project_->loadProject(path)) {
-                if (!project_->parFilePath().isEmpty())
-                    paramEditor_->loadFromFile(project_->parFilePath());
-                connectModules();
-                statusBar()->showMessage(tr("Project loaded: %1").arg(path));
-            } else {
+            // Load into a candidate first. Tearing the old project down before
+            // knowing the new one parses would leave the map widget pointing at
+            // a freed GridDataset/ResultDataset on the failure branch, because
+            // only the success branch re-points it via connectModules().
+            auto* candidate = new Project(this);
+            if (!candidate->loadProject(path)) {
+                delete candidate;
                 QMessageBox::warning(this, tr("Error"),
                     tr("Failed to load project: %1").arg(path));
+                return;
             }
+
+            gridViewer_->cancelBackgroundWork();
+            project_->deleteLater();
+            project_ = candidate;
+
+            if (!project_->parFilePath().isEmpty())
+                paramEditor_->loadFromFile(project_->parFilePath());
+            connectModules();
+            statusBar()->showMessage(tr("Project loaded: %1").arg(path));
         }
     });
 
@@ -323,9 +344,17 @@ void MainWindow::onSimulationFinished(bool success, const QString& outputDir)
 
         if (reply == QMessageBox::Yes) {
             project_->setResultDirectory(outputDir);
+            // Before scanDirectory: it re-indexes the dataset a region scan may
+            // still be reading.
+            gridViewer_->cancelBackgroundWork();
             project_->resultDataset()->scanDirectory(outputDir);
             gridViewer_->setResultDataset(project_->resultDataset());
             gridViewer_->addResultLayer(QFileInfo(outputDir).fileName());
+            // Without this the map and the histogram keep showing the previous
+            // run's frame while being scaled against this one.
+            gridViewer_->showFirstResultFrame();
+            // New frames: the histogram's old scale no longer describes them.
+            gridViewer_->onResultSourceChanged();
             timelineDock_->show();   // un-hide if the user had closed it
             timelineDock_->raise();
         }

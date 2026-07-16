@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QMutex>
+#include <QMutexLocker>
 #include <QString>
 #include <QMap>
 #include <vector>
@@ -34,9 +35,11 @@ public:
     // Load a single result file as frame 0
     bool loadSingleFile(const QString& filePath);
 
-    bool isLoaded() const { return !frameIndex_.isEmpty(); }
-    int frameCount() const { return frameIndex_.size(); }
-    QList<int> timesteps() const { return frameIndex_.keys(); }
+    // Locked: scanDirectory()/clear() rewrite frameIndex_ under mutex_, and
+    // these are read while a background scan over the results may be running.
+    bool isLoaded() const { QMutexLocker lock(&mutex_); return !frameIndex_.isEmpty(); }
+    int frameCount() const { QMutexLocker lock(&mutex_); return frameIndex_.size(); }
+    QList<int> timesteps() const { QMutexLocker lock(&mutex_); return frameIndex_.keys(); }
 
     // Get frame (loads from disk or cache)
     std::shared_ptr<FrameData> frame(int timestep);
@@ -60,7 +63,10 @@ signals:
     void frameLoaded(int timestep);
 
 private:
-    std::shared_ptr<FrameData> loadFrame(const QString& path, int timestep);
+    // Pure: the transpose dimensions are passed in, snapshotted under mutex_ by
+    // the caller, because this runs with the lock released.
+    std::shared_ptr<FrameData> loadFrame(const QString& path, int timestep,
+                                         int expectedRows, int expectedCols);
     void evictCache();
 
     mutable QMutex mutex_;
@@ -72,4 +78,10 @@ private:
     bool transposeResults_ = false;
     int expectedGridRows_ = 0;
     int expectedGridCols_ = 0;
+
+    // Bumped whenever what a frame means changes (re-index, clear, new transpose
+    // dimensions). frame() parses with the lock released, so it re-checks this
+    // before caching: without it a frame decoded under the old interpretation
+    // lands in a cache that was just invalidated, and is served from then on.
+    quint64 generation_ = 0;
 };

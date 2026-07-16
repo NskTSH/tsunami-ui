@@ -34,7 +34,6 @@
 #include <QWheelEvent>
 #include <QApplication>
 #include <QList>
-#include <QPointer>
 
 // Custom view with mouse tracking, wheel zoom, and rubber band finish callback
 class TrackingGraphicsView : public QGraphicsView
@@ -52,13 +51,20 @@ public:
 
 protected:
     void mousePressEvent(QMouseEvent* event) override {
+        // Non-left presses are dropped only while a left drag is in progress, so
+        // a stray right-click cannot abort a rubber band.
         if (mousePressed_ && event->button() != Qt::LeftButton) {
             return;
         }
 
-        mousePressed_ = true;
-        mouseMoved_ = false;
-        pressPos_ = event->pos();
+        // Tracks the LEFT button only. Setting it for any button would latch it
+        // on a bare right-click, whose release the guard above then drops.
+        if (event->button() == Qt::LeftButton) {
+            mousePressed_ = true;
+            mouseMoved_ = false;
+            pressPos_ = event->pos();
+        }
+
         QGraphicsView::mousePressEvent(event);
     }
 
@@ -77,20 +83,27 @@ protected:
     }
 
     void mouseReleaseEvent(QMouseEvent* event) override {
+        // Non-left buttons are ignored only while the left button is actually
+        // down, so that a stray right-click cannot abort a rubber-band drag.
+        // Outside a drag they must reach QGraphicsView like any other event.
         if (mousePressed_ && event->button() != Qt::LeftButton) {
             return;
         }
 
         QGraphicsView::mouseReleaseEvent(event);
 
-        bool wasRubberBand = (dragMode() == QGraphicsView::RubberBandDrag &&
-                              mousePressed_ &&
-                              mouseMoved_);
+        const bool wasRubberBand = (dragMode() == QGraphicsView::RubberBandDrag &&
+                                    mousePressed_ &&
+                                    mouseMoved_);
+
+        if (event->button() == Qt::LeftButton) {
+            mousePressed_ = false;
+        }
 
         if (wasRubberBand && onRubberBandFinished) {
             onRubberBandFinished();
         }
-        else if (onMouseClick) {
+        else if (onMouseClick && event->button() == Qt::LeftButton) {
             onMouseClick(mapToScene(event->pos()));
         }
     }
@@ -106,6 +119,13 @@ GridViewerWidget::GridViewerWidget(QWidget* parent)
     : QWidget(parent)
 {
     setupUI();
+}
+
+GridViewerWidget::~GridViewerWidget()
+{
+    // The scan reads the ResultDataset from a pool thread. Nothing here owns
+    // that dataset, so the scan has to be unwound before this widget goes.
+    cancelBackgroundWork();
 }
 
 void GridViewerWidget::setupUI()
@@ -137,75 +157,61 @@ void GridViewerWidget::setupUI()
     view_->setMouseTracking(true);
     trackView->onMouseMove = [this](QPointF pos) { updateStatusLabel(pos); };
 
-    // Track rubber band selection coordinates
+    // Track rubber band selection coordinates. Qt reports null endpoints when it
+    // tears the band down, which is the only case worth ignoring here; a real
+    // endpoint may legitimately be (0,0), the grid origin.
     connect(trackView, &QGraphicsView::rubberBandChanged, this,
-            [this](QRect, QPointF fromScene, QPointF toScene) {
-        if (fromScene.isNull() || toScene.isNull()) return;
+            [this](QRect viewportRect, QPointF fromScene, QPointF toScene) {
+        if (viewportRect.isNull()) return;
+        hasRubberBand_ = true;
         lastRubberFrom_ = fromScene;
         lastRubberTo_ = toScene;
     });
 
     // When rubber band finished, send region to coast tool
     trackView->onRubberBandFinished = [this]() {
-        if (grid_ && grid_->isLoaded()) {
-            if (lastRubberFrom_.isNull() && lastRubberTo_.isNull()) {
-                return;
-            }
-            int rMin = static_cast<int>(std::min(lastRubberFrom_.y(), lastRubberTo_.y()));
-            int rMax = static_cast<int>(std::max(lastRubberFrom_.y(), lastRubberTo_.y()));
-            int cMin = static_cast<int>(std::min(lastRubberFrom_.x(), lastRubberTo_.x()));
-            int cMax = static_cast<int>(std::max(lastRubberFrom_.x(), lastRubberTo_.x()));
-
-            int rows = grid_->rows();
-            int cols = grid_->cols();
-            rMin = std::max(0, std::min(rMin, rows - 1));
-            rMax = std::max(0, std::min(rMax, rows - 1));
-            cMin = std::max(0, std::min(cMin, cols - 1));
-            cMax = std::max(0, std::min(cMax, cols - 1));
-
-            if (cMin == cMax || rMin == rMax) {
-                return;
-            }
-
-            QPointer<ResultDataset> resultsPtr(results_);
-            if (resultsPtr && resultsPtr->frameCount() > 0) {
-                QList<int> timesteps = resultsPtr->timesteps();
-                int rMinCopy = rMin, rMaxCopy = rMax, cMinCopy = cMin, cMaxCopy = cMax;
-                int selectionId = coastTool_->currentSelectionId() + 1;
-
-                QtConcurrent::run([resultsPtr, timesteps, rMinCopy, rMaxCopy, cMinCopy, cMaxCopy]() {
-                    double globalMax = 0;
-                    if (!resultsPtr) {
-                        return 0.0;
-                    }
-
-                    for (int t : timesteps) {
-                        auto frame = resultsPtr->frame(t);
-                        if (!frame) continue;
-                        if (frame->maxVal == 0 && frame->minVal == 0) continue;
-                        for (int r = rMinCopy; r <= rMaxCopy; ++r) {
-                            for (int c = cMinCopy; c <= cMaxCopy; ++c) {
-                                if (r >= frame->rows || c >= frame->cols) {
-                                    continue;
-                                }
-                                int idx = r * frame->cols + c;
-                                double val = std::abs(frame->values[idx]);
-                                if (val > globalMax) {
-                                    globalMax = val;
-                                }
-                            }
-                        }
-                    }
-                    return globalMax;
-                }).then(this, [this, selectionId](double globalMax) {
-                        coastTool_->setGlobalMaxEta(globalMax, selectionId);
-                    });
-            }
-
-            QRectF rect(cMin, rMin, cMax - cMin + 1, rMax - rMin + 1);
-            scene_->setSelectedRegion(rect);
-            coastTool_->setRegion(rMin, rMax, cMin, cMax);
+        if (!grid_ || !grid_->isLoaded()) {
+            return;
         }
+
+        if (!hasRubberBand_) {
+            return;
+        }
+        hasRubberBand_ = false;
+
+        int rMin = static_cast<int>(std::min(lastRubberFrom_.y(), lastRubberTo_.y()));
+        int rMax = static_cast<int>(std::max(lastRubberFrom_.y(), lastRubberTo_.y()));
+        int cMin = static_cast<int>(std::min(lastRubberFrom_.x(), lastRubberTo_.x()));
+        int cMax = static_cast<int>(std::max(lastRubberFrom_.x(), lastRubberTo_.x()));
+
+        int rows = grid_->rows();
+        int cols = grid_->cols();
+        rMin = std::max(0, std::min(rMin, rows - 1));
+        rMax = std::max(0, std::min(rMax, rows - 1));
+        cMin = std::max(0, std::min(cMin, cols - 1));
+        cMax = std::max(0, std::min(cMax, cols - 1));
+
+        // A drag too thin to cover a cell in either axis selects nothing. Drop
+        // whatever was selected before rather than leaving it on screen looking
+        // like the result of this drag.
+        if (cMin == cMax || rMin == rMax) {
+            clearSelection();
+            return;
+        }
+
+        QRectF rect(cMin, rMin, cMax - cMin + 1, rMax - rMin + 1);
+        scene_->setSelectedRegion(rect);
+
+        // Remembered so the scan can be re-armed if the result set underneath
+        // this selection is later replaced.
+        hasSelection_ = true;
+        selRowMin_ = rMin; selRowMax_ = rMax;
+        selColMin_ = cMin; selColMax_ = cMax;
+
+        // setRegion first: it bumps the selection id, so the scan is tagged with
+        // the id the tool actually holds rather than a predicted one.
+        coastTool_->setRegion(rMin, rMax, cMin, cMax);
+        startRegionScan(rMin, rMax, cMin, cMax);
     };
 
     // Click outside the selected area to deselect
@@ -311,6 +317,10 @@ void GridViewerWidget::setupToolbar()
         QString dir = QFileDialog::getExistingDirectory(this, tr("Select Result Directory"), last);
         if (!dir.isEmpty() && results_) {
             s.setValue("lastResultDir", dir);
+            // A scan may still be reading the dataset that is about to be
+            // re-indexed underneath it.
+            cancelBackgroundWork();
+            invalidateResultEpoch();
             syncGridDims();
             coordLabel_->setText(tr("Scanning %1...").arg(dir));
             results_->scanDirectory(dir);
@@ -319,15 +329,15 @@ void GridViewerWidget::setupToolbar()
             coordLabel_->setText(tr("Loaded: %1 frames from %2")
                 .arg(results_->frameCount()).arg(QFileInfo(dir).fileName()));
 
-            if (results_->frameCount() > 0) {
-                auto frame = results_->frame(0);
-                if (frame) {
-                    coastTool_->setEtaMaxData(frame->values, frame->rows, frame->cols);
-                    if (coastTool_->hasRegion()) {
-                        coastTool_->updateEtaMaxData();
-                    }
-                }
-            }
+            // Loading a directory does not move the animation player off frame
+            // 0, so nothing emits frameChanged and nothing would repaint: the
+            // map would keep showing the previous result set while the tools
+            // showed this one.
+            showFirstResultFrame();
+
+            // These are different frames, so any scale measured over the
+            // previous result set no longer describes them.
+            onResultSourceChanged();
         }
     });
     toolbar_->addWidget(loadResultsDirBtn);
@@ -342,6 +352,10 @@ void GridViewerWidget::setupToolbar()
             tr("Text Files (*.txt);;All Files (*)"));
         if (!path.isEmpty() && results_) {
             s.setValue("lastResultFile", QFileInfo(path).absolutePath());
+            // A scan or an earlier load may still be reading the dataset that is
+            // about to be re-indexed underneath it.
+            cancelBackgroundWork();
+            invalidateResultEpoch();
             syncGridDims();
             results_->loadSingleFile(path);
             animPlayer_->setResultDataset(results_);
@@ -355,9 +369,21 @@ void GridViewerWidget::setupToolbar()
             auto* lbl = coordLabel_;
             auto* grad = gradient_;
             QString fname = QFileInfo(path).fileName();
-            QtConcurrent::run([r]() {
-                return r->frame(0);
-            }).then(this, [sc, ct, pt, lbl, grad, fname](std::shared_ptr<FrameData> frame) {
+            // Tracked, not fire-and-forget: this reads the dataset off the GUI
+            // thread, and nothing else keeps it alive for the parse.
+            const QList<int> loadedSteps = r->timesteps();
+            const int firstStep = loadedSteps.isEmpty() ? 0 : loadedSteps.first();
+            frameLoad_ = QtConcurrent::run([r, firstStep]() {
+                return r->frame(firstStep);
+            });
+            const quint64 epoch = resultEpoch_;
+            frameLoad_.then(this, [this, epoch, sc, ct, pt, lbl, grad, fname](std::shared_ptr<FrameData> frame) {
+                // The result set moved on while this was parsing, so this frame
+                // no longer describes what is loaded.
+                if (epoch != resultEpoch_) {
+                    return;
+                }
+
                 if (frame) {
                     grad->setRange(frame->minVal, frame->maxVal);
                     grad->update();
@@ -372,6 +398,10 @@ void GridViewerWidget::setupToolbar()
                     if (ct->hasRegion()) {
                         ct->updateEtaMaxData();
                     }
+
+                    // These are different frames, so any scale measured over the
+                    // previous result set no longer describes them.
+                    onResultSourceChanged();
                 } else {
                     lbl->setText(tr("Failed to load: %1").arg(fname));
                 }
@@ -655,6 +685,10 @@ void GridViewerWidget::setGridDataset(GridDataset* grid, const QString& filename
         // If results were loaded before bathymetry, update transpose dims
         // and reload the current frame with correct orientation
         if (results_ && results_->isLoaded()) {
+            // New dimensions re-interpret every frame's orientation. A frame load
+            // queued before this point decoded under the old ones, so its
+            // continuation must not be allowed to paint over what follows.
+            invalidateResultEpoch();
             results_->setExpectedGridDims(grid->rows(), grid->cols());
             int curFrame = animPlayer_->currentTimestep();
             auto frame = results_->frame(curFrame);
@@ -676,6 +710,10 @@ void GridViewerWidget::setGridDataset(GridDataset* grid, const QString& filename
 
 void GridViewerWidget::setResultDataset(ResultDataset* results)
 {
+    // Any scan in flight is still reading the outgoing dataset.
+    cancelBackgroundWork();
+    invalidateResultEpoch();
+
     results_ = results;
     animPlayer_->setResultDataset(results);
 }
@@ -711,8 +749,12 @@ void GridViewerWidget::clearOverlay()
 void GridViewerWidget::clearResults()
 {
     clearSelection();
+    invalidateResultEpoch();
     if (results_)
         results_->clear();
+    // The tool keeps its own copy of the frame; without this a later selection
+    // would plot a histogram of results that are no longer loaded.
+    coastTool_->clearEtaMaxData();
     scene_->clearOverlay();
     animPlayer_->setResultDataset(nullptr);
     scene_->rebuildRaster();
@@ -781,11 +823,152 @@ void GridViewerWidget::updateStatusLabel(QPointF scenePos)
 }
 
 void GridViewerWidget::clearSelection() {
+    cancelBackgroundWork();
+    hasSelection_ = false;
+
     if (scene_) {
         scene_->clearSelectionRegion();
     }
 
     if (coastTool_) {
         coastTool_->clearRegion();
+    }
+}
+
+// Scans every frame over the selected region for the largest |eta|, so the
+// histogram keeps one scale across the whole animation instead of rescaling per
+// frame. Runs off the GUI thread: it parses each frame from disk.
+void GridViewerWidget::startRegionScan(int rowMin, int rowMax, int colMin, int colMax)
+{
+    cancelBackgroundWork();
+
+    if (!results_ || results_->frameCount() == 0 || !coastTool_) {
+        return;
+    }
+
+    const QList<int> timesteps = results_->timesteps();
+    const int selectionId = coastTool_->currentSelectionId();
+
+    auto cancelled = std::make_shared<std::atomic_bool>(false);
+    regionScanCancelled_ = cancelled;
+
+    // Deliberately a bare pointer, not a QPointer: a QPointer carries no
+    // cross-thread lifetime guarantee, so testing it here would only narrow the
+    // race, not close it. The dataset is instead held alive by
+    // cancelBackgroundWork(), which every path that can drop it calls first.
+    ResultDataset* results = results_;
+
+    regionScan_ = QtConcurrent::run(
+        [results, timesteps, cancelled, rowMin, rowMax, colMin, colMax]() {
+            double globalMax = 0;
+
+            for (int t : timesteps) {
+                // Polled per frame so a cancel unwinds within one frame load
+                // rather than waiting out the whole directory.
+                if (cancelled->load()) {
+                    return 0.0;
+                }
+
+                auto frame = results->frame(t);
+                if (!frame) continue;
+                // An all-zero frame cannot hold the largest |eta|.
+                if (frame->maxVal == 0 && frame->minVal == 0) continue;
+
+                for (int r = rowMin; r <= rowMax; ++r) {
+                    for (int c = colMin; c <= colMax; ++c) {
+                        if (r >= frame->rows || c >= frame->cols) {
+                            continue;
+                        }
+
+                        const size_t idx = static_cast<size_t>(r) * frame->cols + c;
+                        if (idx >= frame->values.size()) {
+                            continue;
+                        }
+
+                        globalMax = std::max(globalMax, std::abs(frame->values[idx]));
+                    }
+                }
+            }
+
+            return globalMax;
+        });
+
+    regionScan_.then(this, [this, selectionId, cancelled](double globalMax) {
+        if (cancelled->load()) {
+            return;
+        }
+        coastTool_->setGlobalMaxEta(globalMax, selectionId);
+    });
+}
+
+void GridViewerWidget::cancelBackgroundWork()
+{
+    if (regionScanCancelled_) {
+        regionScanCancelled_->store(true);
+    }
+
+    // Both of these hold a bare ResultDataset* and read it off the GUI thread,
+    // so both must be joined, not merely abandoned. The region scan polls the
+    // flag once per frame; the single-file load is one frame, so the wait is
+    // bounded by a single parse in either case.
+    if (regionScan_.isRunning()) {
+        regionScan_.waitForFinished();
+    }
+
+    if (frameLoad_.isRunning()) {
+        frameLoad_.waitForFinished();
+    }
+
+    regionScanCancelled_.reset();
+    regionScan_ = QFuture<double>();
+    frameLoad_ = QFuture<std::shared_ptr<FrameData>>();
+}
+
+// Joining a frame load waits for its parse but cannot un-queue the GUI
+// continuation Qt has already scheduled. Moving the epoch is what makes that
+// continuation drop its frame. Called only where the result set itself changes
+// -- not from cancelBackgroundWork(), which also runs when merely re-arming a
+// scan, where a frame load in flight is still describing the current source.
+void GridViewerWidget::invalidateResultEpoch()
+{
+    ++resultEpoch_;
+}
+
+bool GridViewerWidget::showFirstResultFrame()
+{
+    if (!results_) {
+        return false;
+    }
+
+    // Frames are keyed by the timestep in the file name, so the first key is not
+    // generally 0.
+    const QList<int> timesteps = results_->timesteps();
+    if (timesteps.isEmpty()) {
+        return false;
+    }
+
+    // Routed through the frame-display path rather than pushing samples at the
+    // tools directly: the map overlay and the gradient legend have to move to the
+    // new result set too, or they keep showing the previous one.
+    onFrameChanged(timesteps.first());
+    return true;
+}
+
+// A new result set invalidates the scale the histogram was drawn against: the
+// scan that produced it measured frames that are no longer loaded.
+void GridViewerWidget::onResultSourceChanged()
+{
+    cancelBackgroundWork();
+
+    if (!coastTool_) {
+        return;
+    }
+
+    coastTool_->resetScaleAuthority();
+
+    // Re-arm against the frames now loaded, so the selection keeps a scale
+    // measured over the whole animation rather than one frame.
+    if (hasSelection_) {
+        startRegionScan(selRowMin_, selRowMax_, selColMin_, selColMax_);
     }
 }

@@ -100,7 +100,6 @@ private:
 
     QVector<QGraphicsRectItem*> coastlineCells_;
     bool coastlineVisible_ = true;
-    QMap<int, QPointF> coastlineLabels_;
     QVector<QGraphicsSimpleTextItem*> coastlineLabelItems_;
 
     QImage overlayImage_;
